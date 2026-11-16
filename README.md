@@ -210,6 +210,25 @@ musica ── queue of ~25 songs ──► mpv (background, IPC socket) ◄─�
 
 Errors from the last playback are in `$XDG_RUNTIME_DIR/musica.log`.
 
+## Similar projects
+
+If `musica` isn't what you're looking for, these are other terminal YouTube Music players worth a look:
+
+| Project | Language | Highlights |
+|---|---|---|
+| [ytm-player](https://github.com/peternaame-boop/ytm-player) | Python | full-featured TUI: vim keybindings, synced lyrics, media keys; packaged for several distros |
+| [youtube-music-cli](https://github.com/involvex/youtube-music-cli) | TypeScript | TUI built with React/Ink, plugin system; uses mpv and yt-dlp |
+| [YTerMusic](https://github.com/ccgauche/ytermusic) | Rust | fast and privacy-focused; can use your YouTube Music account |
+| [yewtube](https://github.com/mps-youtube/yewtube) | Python | veteran YouTube (not only Music) player: local playlists, MPRIS, Last.fm |
+| [ytm](https://github.com/MaheshBhushan/yt-music-cli) | Python | very similar recipe (ytmusicapi + yt-dlp + mpv): search, queue, radio, lyrics |
+| [ytui-music](https://github.com/sudipghimire533/ytui-music) | Rust | TUI with mpv; not updated since 2025 |
+| [yt-music-tui](https://github.com/exar1o/yt-music-tui) | Python | a single, very simple curses script |
+
+What `musica` adds: Kitty integration (album art and a tab bar showing what's playing), playback that lives outside
+the terminal (`musica ctl`, background mode, global shortcuts), a 1-2 line bar mode, a Claude Code skill, and it's a
+single file you install by copying it. What others have and `musica` doesn't: lyrics, signing in to your account
+(your playlists and likes) and a library.
+
 ## Disclaimer
 
 Personal project, not affiliated with Google or YouTube. It uses [`ytmusicapi`](https://github.com/sigma67/ytmusicapi)

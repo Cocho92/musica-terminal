@@ -205,6 +205,25 @@ musica ── cola de ~25 temas ──► mpv (de fondo, socket IPC) ◄── y
 
 Los errores de la última reproducción quedan en `$XDG_RUNTIME_DIR/musica.log`.
 
+## Proyectos parecidos
+
+Si `musica` no es lo que buscás, estos son otros reproductores de YouTube Music para la terminal que vale la pena mirar:
+
+| Proyecto | Lenguaje | Lo destacado |
+|---|---|---|
+| [ytm-player](https://github.com/peternaame-boop/ytm-player) | Python | TUI muy completa: atajos tipo vim, letras sincronizadas, teclas multimedia; con paquetes para varias distros |
+| [youtube-music-cli](https://github.com/involvex/youtube-music-cli) | TypeScript | TUI hecha con React/Ink, con sistema de plugins; usa mpv y yt-dlp |
+| [YTerMusic](https://github.com/ccgauche/ytermusic) | Rust | rápido y enfocado en privacidad; puede usar tu cuenta de YouTube Music |
+| [yewtube](https://github.com/mps-youtube/yewtube) | Python | veterano, para YouTube en general (no solo Music): listas locales, MPRIS, Last.fm |
+| [ytm](https://github.com/MaheshBhushan/yt-music-cli) | Python | receta muy parecida (ytmusicapi + yt-dlp + mpv): búsqueda, cola, radio, letras |
+| [ytui-music](https://github.com/sudipghimire533/ytui-music) | Rust | TUI con mpv; sin cambios desde 2025 |
+| [yt-music-tui](https://github.com/exar1o/yt-music-tui) | Python | un solo script con curses, muy simple |
+
+Lo que suma `musica`: integración con Kitty (tapas y barra de pestañas con lo que suena), la música corre aparte de
+la terminal (`musica ctl`, modo de fondo, atajos globales), modo barra de 1-2 líneas, una skill para Claude Code, y es
+un solo archivo que se instala copiándolo. Lo que tienen otros y `musica` no: letras, entrar con tu cuenta (tus
+playlists y "me gusta") y biblioteca.
+
 ## Aviso
 
 Proyecto personal, no afiliado a Google ni a YouTube. Usa [`ytmusicapi`](https://github.com/sigma67/ytmusicapi)
