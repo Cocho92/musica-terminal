@@ -1,0 +1,8 @@
+# Configuración de yt-dlp para `musica` → copiar a ~/.config/yt-dlp/config
+#
+# YouTube manda un desafío en JavaScript; si yt-dlp no tiene con qué resolverlo, YouTube limita la velocidad y la
+# música se corta ("Buffering", "Cache: 0.0s"). yt-dlp usa Deno automáticamente si está instalado. Si en cambio
+# tenés Bun o Node, descomentá UNA de estas líneas (y poné la ruta real, ver `which bun` / `which node`):
+#
+# --js-runtimes bun:/ruta/a/bun
+# --js-runtimes node:/ruta/a/node

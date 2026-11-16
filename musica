@@ -1,0 +1,835 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["ytmusicapi"]
+# ///
+"""musica: busca canciones en YouTube Music y las reproduce (solo audio) con mpv, en segundo plano.
+
+Uso:
+  musica <búsqueda>             menú con flechas, Enter reproduce y abre el reproductor
+  musica -l <búsqueda>          solo lista los 5 resultados numerados
+  musica -n N <búsqueda>        reproduce el resultado N y abre el reproductor
+  musica -b <búsqueda>          menú y la deja sonando DE FONDO: no abre reproductor y sigue aunque cierres
+                                la terminal (se ve en la barra de Kitty; se maneja con atajos o musica ctl)
+  musica -b -n N <búsqueda>     igual, reproduce el resultado N sin menú (para Claude/scripts)
+  musica ui                     abre el reproductor de lo que esté sonando (q o cerrar la terminal la paran)
+  musica -m <búsqueda>          igual que sin -m, pero abre el modo barra (1-2 líneas)
+  musica ui -m                  abre el modo barra de lo que esté sonando
+  musica ctl status|pause|play|toggle|next|prev|stop
+  musica ctl vol N|+N|-N        volumen absoluto o relativo (0-130)
+  musica ctl seek S|+S|-S       ir al segundo S, o adelantar/atrasar S segundos
+Con el reproductor abierto, salir (q) o cerrar la terminal para la música. Con -b queda de fondo hasta `musica ctl stop`.
+Requiere: mpv, yt-dlp (en el PATH). En Kitty muestra la tapa del álbum.
+"""
+import json
+import os
+import re
+import select
+import signal
+import shutil
+import socket
+import subprocess
+import sys
+import termios
+import time
+import tty
+import urllib.request
+
+RESULTADOS = 5
+RUNDIR = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+SOCK = f"{RUNDIR}/musica-mpv.sock"
+LOG = f"{RUNDIR}/musica.log"
+META = f"{RUNDIR}/musica-now.json"
+
+
+# ---------------------------------------------------------------- control de mpv por socket
+def mpv(*command):
+    """Envía un comando al mpv en curso; devuelve 'data' o lanza ConnectionError si no hay nada sonando."""
+    try:
+        s = socket.socket(socket.AF_UNIX)
+        s.settimeout(3)
+        s.connect(SOCK)
+    except OSError:
+        raise ConnectionError("no hay música sonando") from None
+    with s:
+        s.sendall(json.dumps({"command": list(command), "request_id": 1}).encode() + b"\n")
+        buf = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                raise ConnectionError("mpv cerró la conexión")
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                msg = json.loads(line)
+                if msg.get("request_id") == 1:
+                    if msg.get("error") != "success":
+                        raise RuntimeError(msg.get("error"))
+                    return msg.get("data")
+
+
+def prop(name):
+    try:
+        return mpv("get_property", name)
+    except RuntimeError:     # propiedad no disponible todavía (p. ej. duración mientras carga)
+        return None
+
+
+def hms(seg) -> str:
+    seg = int(seg or 0)
+    return f"{seg // 3600}:{seg % 3600 // 60:02d}:{seg % 60:02d}" if seg >= 3600 else f"{seg // 60}:{seg % 60:02d}"
+
+
+def estado() -> str:
+    pausa = "⏸ en pausa" if prop("pause") else "▶ sonando"
+    meta = leer_meta(prop("path") or "")
+    titulo = " — ".join(x for x in (meta.get("title"), meta.get("artists")) if x) or prop("media-title")
+    n_total = prop("playlist-count") or 1
+    cola = f" · tema {(prop('playlist-pos') or 0) + 1} de {n_total}" if n_total > 1 else ""
+    return (f"{pausa}: {titulo} · {hms(prop('time-pos'))} / {hms(prop('duration'))} "
+            f"· volumen {round(prop('volume') or 0)}%{cola}")
+
+
+def ctl(args: list[str]) -> int:
+    accion, valor = (args + [None, None])[:2]
+    try:
+        if accion == "status":
+            pass
+        elif accion in ("pause", "play"):
+            mpv("set_property", "pause", accion == "pause")
+        elif accion == "toggle":
+            mpv("cycle", "pause")
+        elif accion in ("next", "prev"):
+            mpv("playlist-next" if accion == "next" else "playlist-prev", "force")
+            time.sleep(1.5)  # deja que cargue el tema nuevo antes de mostrar el estado
+        elif accion == "stop":
+            mpv("quit")
+            print("⏹ música detenida")
+            return 0
+        elif accion == "vol" and valor:
+            if valor[0] in "+-":
+                mpv("add", "volume", float(valor))
+            else:
+                mpv("set_property", "volume", float(valor))
+        elif accion == "seek" and valor:
+            mpv("seek", float(valor), "relative" if valor[0] in "+-" else "absolute")
+        else:
+            print("uso: musica ctl status|pause|play|toggle|next|prev|stop | vol N|+N|-N | seek S|+S|-S",
+                  file=sys.stderr)
+            return 2
+        time.sleep(0.2)
+        print(estado())
+        return 0
+    except ConnectionError as e:
+        print(f"musica: {e}", file=sys.stderr)
+        return 1
+    except (RuntimeError, ValueError) as e:
+        print(f"musica: mpv no aceptó el comando ({e})", file=sys.stderr)
+        return 1
+
+
+# ---------------------------------------------------------------- reproducción (siempre en segundo plano)
+RADIO = 25    # temas en la cola: el elegido + recomendaciones de YouTube Music
+
+
+def datos(c: dict) -> dict:
+    """Lo que el reproductor muestra de una canción (de una búsqueda o de la radio de YouTube Music)."""
+    thumbs = sorted(c.get("thumbnails") or c.get("thumbnail") or [], key=lambda t: t.get("width") or 0)
+    return {"id": c["videoId"], "title": c.get("title") or "",
+            "artists": ", ".join(a["name"] for a in c.get("artists") or []),
+            "album": (c.get("album") or {}).get("name") or "",
+            "thumb": re.sub(r"=w\d+-h\d+", "=w400-h400", thumbs[-1]["url"]) if thumbs else ""}
+
+
+UI_PID = f"{RUNDIR}/musica-ui.pid"
+
+
+def ui_abierto() -> bool:
+    """¿Hay un `musica ui` abierto en otra terminal?"""
+    try:
+        with open(UI_PID) as f:
+            pid = int(f.read().strip())
+        if pid == os.getpid():
+            return False
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def url(video_id: str) -> str:
+    # Los temas los eligen la búsqueda y la radio de YouTube Music; esto es solo de dónde mpv baja el audio.
+    # www.youtube.com en vez de music.youtube.com: es el mismo archivo (probado byte a byte) y es la única forma que
+    # el plugin MPRIS reconoce para mostrar la tapa en el applet de sonido de Cinnamon.
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def cargar(c: dict, modo: str) -> None:
+    """Agrega un tema a mpv con su título (lo que muestra el applet de sonido por MPRIS). Solo el título: algunos
+    streams traen su propio título y el plugin prefiere ese, así que con artista quedaría a veces sí y a veces no."""
+    titulo = c.get("title") or c["id"]
+    largo = len(titulo.encode())               # %N% = los próximos N bytes, sin problemas con comas
+    mpv("loadfile", url(c["id"]), modo, f"force-media-title=%{largo}%{titulo}")
+
+
+def reproducir(cancion: dict, texto: str, yt) -> int:
+    """Pone `cancion` seguida de su radio (canciones parecidas). Si ya hay un mpv sonando, le reemplaza la cola
+    (así el reproductor abierto en otra terminal sigue y se actualiza); si no, arranca un mpv independiente de la
+    terminal. Espera a que suene."""
+    cola = [datos(cancion)]
+    try:
+        radio = yt.get_watch_playlist(cancion["videoId"], limit=RADIO)["tracks"]
+        cola += [datos(t) for t in radio if t.get("videoId") and t["videoId"] != cancion["videoId"]][:RADIO - 1]
+    except Exception:
+        pass     # sin radio: suena solo la elegida
+    with open(META, "w") as f:
+        json.dump({"queue": cola}, f, ensure_ascii=False)
+
+    proc = None
+    try:
+        mpv("get_property", "pid")   # ¿ya hay un mpv sonando? se reutiliza (el reproductor abierto sigue)
+    except (ConnectionError, RuntimeError):
+        # mpv vacío, independiente de la terminal; --idle=once: se cierra solo al terminar la cola
+        with open(LOG, "w") as log:
+            proc = subprocess.Popen(
+                ["mpv", "--no-video", "--ytdl-format=234/233/bestaudio/best", "--no-input-terminal", "--quiet",
+                 "--idle=once", f"--input-ipc-server={SOCK}"],
+                stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        for _ in range(50):          # espera a que el socket esté listo
+            time.sleep(0.1)
+            try:
+                mpv("get_property", "pid")
+                break
+            except (ConnectionError, RuntimeError):
+                if proc.poll() is not None:
+                    break
+    try:
+        cargar(cola[0], "replace")
+        for c in cola[1:]:
+            cargar(c, "append")
+        mpv("set_property", "pause", False)
+    except (ConnectionError, RuntimeError) as e:
+        print(f"musica: no pude cargar la cola en mpv ({e}), ver {LOG}", file=sys.stderr)
+        return 1
+    for _ in range(60):      # espera hasta 30 s a que empiece a sonar la elegida
+        time.sleep(0.5)
+        if proc is not None and proc.poll() is not None:
+            print(f"musica: mpv terminó con error, ver {LOG}", file=sys.stderr)
+            return 1
+        try:
+            if cola[0]["id"] in (prop("path") or "") and prop("time-pos") is not None:
+                print(f"▶ sonando: {texto}")
+                return 0
+        except ConnectionError:
+            if proc is None:
+                print("musica: el reproductor se cerró mientras cargaba", file=sys.stderr)
+                return 1
+    print(f"musica: mpv arrancó pero todavía no suena (ver {LOG})", file=sys.stderr)
+    return 1
+
+
+# ---------------------------------------------------------------- reproductor en la terminal
+RST, BOLD, DIM = "\x1b[0m", "\x1b[1m", "\x1b[2m"
+ACC, ACC2, MUTE = "\x1b[38;5;213m", "\x1b[38;5;117m", "\x1b[38;5;244m"   # rosa, celeste, gris
+IMG_W, IMG_H = 10, 5    # celdas que ocupa la tapa del álbum
+
+
+def leer_cola() -> list[dict]:
+    """La cola que se le pasó a mpv (mismo orden que su playlist), o []."""
+    try:
+        with open(META) as f:
+            return json.load(f).get("queue") or []
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def leer_meta(ruta_mpv: str) -> dict:
+    """Los datos de la canción que mpv está reproduciendo (por su id en la URL), o {}."""
+    return next((c for c in leer_cola() if c.get("id") and c["id"] in ruta_mpv), {})
+
+
+def tapa(meta: dict) -> str | None:
+    """Ruta local de la tapa del álbum (la baja una vez por canción), o None."""
+    if not meta.get("thumb") or not meta.get("id"):
+        return None
+    path = f"{RUNDIR}/musica-tapa-{meta['id']}.jpg"
+    if not os.path.exists(path):
+        try:
+            for viejo in os.listdir(RUNDIR):
+                if viejo.startswith("musica-tapa-"):
+                    os.remove(os.path.join(RUNDIR, viejo))
+            req = urllib.request.Request(meta["thumb"], headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as r, open(path, "wb") as f:
+                f.write(r.read())
+        except OSError:
+            return None
+    return path
+
+
+def es_kitty() -> bool:
+    return (os.environ.get("TERM") == "xterm-kitty" or "KITTY_WINDOW_ID" in os.environ) and bool(shutil.which("kitty"))
+
+
+def ui() -> int:
+    if not sys.stdin.isatty():
+        print("musica: el reproductor necesita una terminal", file=sys.stderr)
+        return 1
+    try:
+        mpv("get_property", "pid")
+    except ConnectionError:
+        print("musica: no hay música sonando", file=sys.stderr)
+        return 1
+    fd = sys.stdin.fileno()
+    viejo = termios.tcgetattr(fd)
+    out = sys.stdout
+    con_imagen = es_kitty()
+    # Íconos de un mismo estilo, de una celda. En Kitty: Material Design de Nerd Font (códigos que ninguna otra
+    # fuente del sistema usa; los de Font Awesome chocan con Tibetan Machine Uni) seguidos de un espacio duro:
+    # Kitty dibuja al doble de ancho un ícono seguido de un espacio normal.
+    global ICONOS
+    if con_imagen:
+        ICONOS = {k: v + " " for k, v in {
+            "nota": "\U000F0387", "play": "\U000F040A", "pausa": "\U000F03E4", "ant": "\U000F04AE",
+            "sig": "\U000F04AD", "vol0": "\U000F0581", "vol1": "\U000F057F", "vol2": "\U000F0580",
+            "vol3": "\U000F057E"}.items()}
+    else:
+        ICONOS = {"nota": "♪ ", "play": "▶ ", "pausa": "‖ ", "ant": "◂ ", "sig": "▸ ",
+                  "vol0": "∅ ", "vol1": "♪ ", "vol2": "♪ ", "vol3": "♪ "}
+    clave, mensaje = None, ""
+    parar = True    # q, Ctrl+C o cerrar la terminal paran la música; b la deja de fondo
+
+    def colgar(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGHUP, colgar)
+    signal.signal(signal.SIGTERM, colgar)
+    with open(UI_PID, "w") as f:         # así otra búsqueda sabe que hay un reproductor abierto
+        f.write(str(os.getpid()))
+    out.write("\x1b[?1049h\x1b[?25l")    # pantalla alternativa, ocultar cursor
+    try:
+        tty.setcbreak(fd)
+        while True:
+            try:
+                titulo_mpv, pos, dur = prop("media-title"), prop("time-pos"), prop("duration")
+                pausa, vol = prop("pause"), prop("volume") or 0
+                ruta_mpv = prop("path") or ""
+                n_tema, n_total = (prop("playlist-pos") or 0) + 1, prop("playlist-count") or 1
+            except ConnectionError:
+                mensaje = "⏹ la música terminó"
+                break
+            meta = leer_meta(ruta_mpv)
+            cols, filas = shutil.get_terminal_size()
+            ancho = max(40, min(cols - 2, 120))
+            nueva_clave = (meta.get("id") or titulo_mpv, cols, filas)
+            imagen = con_imagen and ancho >= 60
+            col_der = ancho >= 96                          # columna derecha con anterior/siguiente
+            RW = 36 if col_der else 0                      # ancho de esa columna
+            sep = ancho - RW - 1                           # columna del separador vertical
+            x0 = 3 + (IMG_W + 2 if imagen else 0)          # columna donde empieza el texto
+            interior = ancho - (x0 - 1) - 2 - (RW + 1 if col_der else 0)
+            alto = (max(IMG_H, 5) if imagen else 5) + 2
+
+            if nueva_clave != clave:                     # canción nueva o cambio de tamaño: redibujar todo
+                clave = nueva_clave
+                out.write("\x1b[2J\x1b[H")
+                # cada fila con posición absoluta (\n solo no vuelve a la columna 1 en todas las terminales)
+                if col_der:
+                    out.write(f"\x1b[1;1H{MUTE}╭{'─' * (sep - 2)}┬{'─' * (ancho - sep - 1)}╮{RST}")
+                    for f in range(2, alto):
+                        out.write(f"\x1b[{f};1H{MUTE}│{' ' * (sep - 2)}│{' ' * (ancho - sep - 1)}│{RST}")
+                else:
+                    out.write(f"\x1b[1;1H{MUTE}╭{'─' * (ancho - 2)}╮{RST}")
+                    for f in range(2, alto):
+                        out.write(f"\x1b[{f};1H{MUTE}│{' ' * (ancho - 2)}│{RST}")
+                # controles dentro del borde inferior
+                teclas = (("espacio", "pausa"), ("←/→", "±10s"), ("↑/↓", "volumen"), ("n/p", "tema"),
+                          ("q", "salir"), ("b", "fondo"))
+                if sum(len(k) + len(l) + 4 for k, l in teclas) > ancho - 6:
+                    teclas = tuple((k, "") for k, _ in teclas)
+                visible = " · ".join(f"{k} {l}".strip() for k, l in teclas)
+                ctrl = f" {MUTE}·{RST} ".join(f"{MUTE}{k}{RST} {l}".rstrip() for k, l in teclas)
+                resto = max(0, ancho - 5 - len(visible))
+                out.write(f"\x1b[{alto};1H{MUTE}╰─{RST} {ctrl} {MUTE}{'─' * resto}╯{RST}")
+                out.flush()
+                if imagen and (ruta := tapa(meta)):
+                    termios.tcsetattr(fd, termios.TCSADRAIN, viejo)
+                    subprocess.run(["kitty", "+kitten", "icat", "--stdin=no", "--transfer-mode=memory",
+                                    "--place", f"{IMG_W}x{IMG_H}@2x1", "--scale-up", ruta],
+                                   stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    tty.setcbreak(fd)
+
+            def linea(fila: int, texto: str, visible: int):
+                relleno = max(0, interior - visible)
+                out.write(f"\x1b[{fila};{x0}H{texto}{' ' * relleno}")
+
+            def corta(s: str, n: int) -> str:
+                return s if len(s) <= n else s[:n - 1] + "…"
+
+            titulo = corta(meta.get("title") or titulo_mpv or "…", interior - 3)
+            sub = " · ".join(x for x in (meta.get("artists"), meta.get("album")) if x)
+            sub = corta(sub, interior - 3)
+            t_pos, t_dur = hms(pos), hms(dur)
+            barra_n = max(10, interior - len(t_pos) - len(t_dur) - 6)
+            lleno = int(barra_n * (pos or 0) / dur) if dur else 0
+            barra = f"{ACC}{'━' * lleno}{RST}{ACC}●{RST}{MUTE}{'─' * max(0, barra_n - lleno - 1)}{RST}"
+            icono = f"{ACC2}{ICONOS['pausa']}{RST}" if pausa else f"{ACC}{ICONOS['play']}{RST}"
+            vol_n = round(min(vol, 100) / 10)
+            vol_barra = f"{ACC2}{'▮' * vol_n}{RST}{MUTE}{'▯' * (10 - vol_n)}{RST}"
+            vol_ico = ICONOS["vol0" if vol <= 0 else "vol1" if vol < 34 else "vol2" if vol < 67 else "vol3"]
+            y = 2 + (alto - 2 - 5) // 2              # texto (5 filas) centrado en la caja
+            linea(y, f"{ACC}{ICONOS['nota']}{RST} {BOLD}{titulo}{RST}", 3 + len(titulo))
+            linea(y + 1, f"   {DIM}{sub}{RST}", 3 + len(sub))
+            linea(y + 3, f"{icono} {t_pos} {barra} {t_dur}", 3 + len(t_pos) + barra_n + 2 + len(t_dur))
+            estado_txt = ("en pausa" if pausa else "sonando") + (f" · tema {n_tema} de {n_total}" if n_total > 1 else "")
+            linea(y + 4, f"{ACC2}{vol_ico}{RST} {round(vol):>3}% {vol_barra}   {MUTE}{estado_txt}{RST}",
+                  3 + 5 + 10 + 3 + len(estado_txt))
+            # anterior / siguiente de la cola (mismo orden que la playlist de mpv)
+            cola = leer_cola()
+            ant = cola[n_tema - 2] if n_total > 1 and 0 <= n_tema - 2 < len(cola) else None
+            sig = cola[n_tema] if n_total > 1 and 0 <= n_tema < len(cola) else None
+            i_ant, i_sig = ICONOS["ant"], ICONOS["sig"]
+            if col_der:
+                w = RW - 5
+                for fila, c, icono_c, estilo in ((y, ant, i_ant, MUTE), (y + 3, sig, i_sig, "")):
+                    tit = corta(c["title"], w) if c else ""
+                    art = corta(c.get("artists") or "", w) if c else ""
+                    ico = f"{ACC2}{icono_c}{RST}" if c else "  "
+                    out.write(f"\x1b[{fila};{sep + 2}H{ico} {estilo}{tit}{RST}{' ' * (w - len(tit))}")
+                    out.write(f"\x1b[{fila + 1};{sep + 2}H   {DIM}{art}{RST}{' ' * (w - len(art))}")
+            else:                                    # terminal angosta: una línea compacta debajo
+                partes = [f"{ACC2}{i}{RST} {corta(c['title'], (ancho - 12) // 2)}"
+                          for i, c in ((i_ant, ant), (i_sig, sig)) if c]
+                out.write(f"\x1b[{alto + 1};2H\x1b[K" + f"  {MUTE}·{RST}  ".join(partes))
+            out.flush()
+
+            if select.select([sys.stdin], [], [], 0.5)[0]:
+                k = os.read(fd, 16).decode(errors="ignore")
+                try:
+                    if k == "b":
+                        parar = False
+                        break
+                    elif k in ("q", "s"):
+                        break
+                    elif k == " ":
+                        mpv("cycle", "pause")
+                    elif k == "n":
+                        mpv("playlist-next", "force")
+                    elif k == "p":
+                        mpv("playlist-prev", "force")
+                    elif k in ("\x1b[C", "\x1bOC"):
+                        mpv("seek", 10, "relative")
+                    elif k in ("\x1b[D", "\x1bOD"):
+                        mpv("seek", -10, "relative")
+                    elif k in ("0", "\x1b[A", "\x1bOA"):
+                        mpv("add", "volume", 5)
+                    elif k in ("9", "\x1b[B", "\x1bOB"):
+                        mpv("add", "volume", -5)
+                except (ConnectionError, RuntimeError):
+                    pass
+    except KeyboardInterrupt:      # Ctrl+C, o la terminal se cerró (SIGHUP/SIGTERM)
+        pass
+    finally:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)   # terminar de limpiar aunque la terminal ya no exista
+        try:
+            with open(UI_PID) as f:
+                if f.read().strip() == str(os.getpid()):
+                    os.remove(UI_PID)
+        except OSError:
+            pass
+        if parar and not mensaje:
+            try:
+                mpv("quit")
+                mensaje = "⏹ música detenida"
+            except (ConnectionError, RuntimeError):
+                pass
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, viejo)
+            if con_imagen:
+                subprocess.run(["kitty", "+kitten", "icat", "--clear", "--stdin=no"],
+                               stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+            out.write("\x1b[?25h\x1b[?1049l")     # mostrar cursor, volver a la pantalla normal
+            out.flush()
+        except (OSError, subprocess.SubprocessError):
+            pass                                   # la terminal ya no existe
+    try:
+        print(mensaje or "♪ sigue sonando de fondo · musica ui para volver · Alt+Shift+S o musica ctl stop para parar")
+    except OSError:
+        pass
+    return 0
+
+
+# ---------------------------------------------------------------- modo barra (1-2 líneas)
+def iconos(con_imagen: bool) -> dict:
+    """Los mismos íconos que el reproductor grande (Material Design + espacio duro en Kitty)."""
+    if con_imagen:
+        return {k: v + " " for k, v in {
+            "nota": "\U000F0387", "play": "\U000F040A", "pausa": "\U000F03E4", "ant": "\U000F04AE",
+            "sig": "\U000F04AD", "vol0": "\U000F0581", "vol1": "\U000F057F", "vol2": "\U000F0580",
+            "vol3": "\U000F057E"}.items()}
+    return {"nota": "♪ ", "play": "▶ ", "pausa": "‖ ", "ant": "◂ ", "sig": "▸ ",
+            "vol0": "∅ ", "vol1": "♪ ", "vol2": "♪ ", "vol3": "♪ "}
+
+
+def cartel(s: str, w: int, t: float) -> str:
+    """`s` en `w` columnas; si no entra, se desplaza como una cartelera."""
+    if w <= 0:
+        return ""
+    if len(s) <= w:
+        return s + " " * (w - len(s))
+    s2 = s + "   •   "
+    vuelta = len(s2) / 4 + 2          # 4 caracteres por segundo + 2 s quieto al principio de cada vuelta
+    tt = t % vuelta
+    off = 0 if tt < 2 else int((tt - 2) * 4) % len(s2)
+    return (s2 + s2)[off:off + w]
+
+
+def barra() -> int:
+    if not sys.stdin.isatty():
+        print("musica: la barra necesita una terminal", file=sys.stderr)
+        return 1
+    try:
+        mpv("get_property", "pid")
+    except ConnectionError:
+        print("musica: no hay música sonando", file=sys.stderr)
+        return 1
+    fd = sys.stdin.fileno()
+    viejo = termios.tcgetattr(fd)
+    out = sys.stdout
+    con_imagen = es_kitty()
+    I = iconos(con_imagen)
+    clave, mensaje = None, ""
+    parar = True
+    inicio = time.monotonic()
+
+    def colgar(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGHUP, colgar)
+    signal.signal(signal.SIGTERM, colgar)
+    with open(UI_PID, "w") as f:
+        f.write(str(os.getpid()))
+    out.write("\x1b[?1049h\x1b[?25l\x1b[2J")
+    try:
+        tty.setcbreak(fd)
+        while True:
+            try:
+                pos, dur, pausa = prop("time-pos"), prop("duration"), prop("pause")
+                vol, ruta_mpv = prop("volume") or 0, prop("path") or ""
+                n_tema, n_total = (prop("playlist-pos") or 0) + 1, prop("playlist-count") or 1
+                titulo_mpv = prop("media-title")
+            except ConnectionError:
+                mensaje = "⏹ la música terminó"
+                break
+            meta = leer_meta(ruta_mpv)
+            cola = leer_cola()
+            sig = cola[n_tema] if n_total > 1 and 0 <= n_tema < len(cola) else None
+            cols, filas = shutil.get_terminal_size()
+            dos = filas >= 2
+            tapa_ok = con_imagen and dos and cols >= 60
+            x = 6 if tapa_ok else 1                     # columna donde empieza el texto
+            W = cols - x                                # columnas disponibles para el texto
+            t = time.monotonic() - inicio
+
+            nueva_clave = (meta.get("id") or titulo_mpv, cols, filas)
+            if nueva_clave != clave:
+                clave = nueva_clave
+                out.write("\x1b[2J")
+                out.flush()
+                if con_imagen:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, viejo)
+                    subprocess.run(["kitty", "+kitten", "icat", "--clear", "--stdin=no"],
+                                   stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    if tapa_ok and (ruta := tapa(meta)):
+                        subprocess.run(["kitty", "+kitten", "icat", "--stdin=no", "--transfer-mode=memory",
+                                        "--scale-up", "--place", "4x2@0x0", ruta],
+                                       stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    tty.setcbreak(fd)
+
+            nombre = " — ".join(z for z in (meta.get("title") or titulo_mpv, meta.get("artists")) if z) or "…"
+            sig_txt = " — ".join(z for z in (sig.get("title"), sig.get("artists")) if z) if sig else ""
+            play = f"{ACC2}{I['pausa']}{RST}" if pausa else f"{ACC}{I['play']}{RST}"
+            vol_ico = I["vol0" if vol <= 0 else "vol1" if vol < 34 else "vol2" if vol < 67 else "vol3"]
+            t_pos, t_dur = hms(pos), hms(dur)
+            vol_txt = f"{round(vol)}%"
+            pos_cola = f"{n_tema}/{n_total}" if n_total > 1 else ""
+            ayuda = "␣ ←→ ↑↓ n/p q b"
+
+            def progreso(n: int) -> str:
+                n = max(5, n)
+                lleno = int(n * (pos or 0) / dur) if dur else 0
+                return f"{ACC}{'━' * lleno}●{RST}{MUTE}{'─' * max(0, n - lleno - 1)}{RST}"
+
+            if dos:
+                # línea 1: tema actual (cartelera) y, si hay lugar, el siguiente
+                w_sig = min(40, W // 3) if sig and W >= 70 else 0
+                w_nom = W - 2 - (w_sig + 5 if w_sig else 0)
+                l1 = f"{ACC}{I['nota']}{RST}{BOLD}{cartel(nombre, w_nom, t)}{RST}"
+                if w_sig:
+                    l1 += f"   {ACC2}{I['sig']}{RST}{MUTE}{cartel(sig_txt, w_sig, t)}{RST}"
+                # línea 2: play, tiempo, barra, volumen, posición en la cola, ayuda
+                fijo = f"  {ACC2}{vol_ico}{RST}{vol_txt}" + (f"  {MUTE}{pos_cola}{RST}" if pos_cola else "")
+                fijo_len = 2 + 2 + len(vol_txt) + (2 + len(pos_cola) if pos_cola else 0)
+                if W - fijo_len - len(ayuda) - 3 >= 30:
+                    fijo += f"   {MUTE}{ayuda}{RST}"
+                    fijo_len += 3 + len(ayuda)
+                n_barra = W - 2 - len(t_pos) - len(t_dur) - 2 - fijo_len
+                l2 = f"{play}{t_pos} {progreso(n_barra)} {t_dur}{fijo}"
+                out.write(f"\x1b[1;{x}H{l1}\x1b[K\x1b[2;{x}H{l2}\x1b[K")
+            else:
+                # una sola línea: play, nombre (cartelera), tiempo + barra corta, volumen
+                w_nom = max(10, W // 2 - 4)
+                resto = W - 2 - w_nom - 2 - len(t_pos) - len(t_dur) - 2 - (2 + 2 + len(vol_txt))
+                l1 = (f"{play}{BOLD}{cartel(nombre, w_nom, t)}{RST}  {t_pos} {progreso(resto)} {t_dur}"
+                      f"  {ACC2}{vol_ico}{RST}{vol_txt}")
+                out.write(f"\x1b[1;{x}H{l1}\x1b[K")
+            out.flush()
+
+            if select.select([sys.stdin], [], [], 0.25)[0]:
+                k = os.read(fd, 16).decode(errors="ignore")
+                try:
+                    if k == "b":
+                        parar = False
+                        break
+                    elif k in ("q", "s"):
+                        break
+                    elif k == " ":
+                        mpv("cycle", "pause")
+                    elif k == "n":
+                        mpv("playlist-next", "force")
+                    elif k == "p":
+                        mpv("playlist-prev", "force")
+                    elif k in ("\x1b[C", "\x1bOC"):
+                        mpv("seek", 10, "relative")
+                    elif k in ("\x1b[D", "\x1bOD"):
+                        mpv("seek", -10, "relative")
+                    elif k in ("0", "\x1b[A", "\x1bOA"):
+                        mpv("add", "volume", 5)
+                    elif k in ("9", "\x1b[B", "\x1bOB"):
+                        mpv("add", "volume", -5)
+                except (ConnectionError, RuntimeError):
+                    pass
+    except KeyboardInterrupt:      # Ctrl+C, o la terminal se cerró
+        pass
+    finally:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        try:
+            with open(UI_PID) as f:
+                if f.read().strip() == str(os.getpid()):
+                    os.remove(UI_PID)
+        except OSError:
+            pass
+        if parar and not mensaje:  # q o cerrar la terminal paran la música; b la deja de fondo
+            try:
+                mpv("quit")
+                mensaje = "⏹ música detenida"
+            except (ConnectionError, RuntimeError):
+                pass
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, viejo)
+            if con_imagen:
+                subprocess.run(["kitty", "+kitten", "icat", "--clear", "--stdin=no"],
+                               stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+            out.write("\x1b[?25h\x1b[?1049l")
+            out.flush()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        print(mensaje or "♪ sigue sonando de fondo · musica ui -m para volver · Alt+Shift+S o musica ctl stop para parar")
+    except OSError:
+        pass
+    return 0
+
+
+# ---------------------------------------------------------------- menú de resultados
+MINI_W, MINI_H = 6, 3   # celdas de la tapa chiquita de cada opción
+
+
+def mini_tapas(canciones: list[dict]) -> list[str | None]:
+    """Baja en paralelo las tapas chiquitas de los resultados; ruta local o None por cada una."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def bajar(c):
+        d = datos(c)
+        if not d["thumb"]:
+            return None
+        path = f"{RUNDIR}/musica-mini-{d['id']}.jpg"
+        if os.path.exists(path):
+            return path
+        try:
+            url = re.sub(r"=w\d+-h\d+", "=w120-h120", d["thumb"])
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as r, open(path, "wb") as f:
+                f.write(r.read())
+            return path
+        except OSError:
+            return None
+
+    with ThreadPoolExecutor(len(canciones)) as ex:
+        return list(ex.map(bajar, canciones))
+
+
+def menu(consulta: str, canciones: list[dict]) -> int | None:
+    """Menú propio: tapa chiquita + título + artista/álbum; ↑/↓ o 1-5 y Enter. Devuelve el índice o None."""
+    fd = sys.stdin.fileno()
+    viejo = termios.tcgetattr(fd)
+    out = sys.stdout
+    con_imagen = es_kitty()
+    tapas = mini_tapas(canciones) if con_imagen else [None] * len(canciones)
+    x0 = 4 + (MINI_W + 2 if con_imagen else 0)
+    alto_item = MINI_H if con_imagen else 2
+    sel, resultado = 0, None
+
+    def corta(s: str, n: int) -> str:
+        return s if len(s) <= n else s[:n - 1] + "…"
+
+    def dibujar_item(i: int):
+        c = canciones[i]
+        y = 3 + i * (alto_item + 1) + (alto_item - 2) // 2
+        ancho = shutil.get_terminal_size().columns - x0 - 1
+        artistas = ", ".join(a["name"] for a in c.get("artists") or []) or "?"
+        album = (c.get("album") or {}).get("name") or ""
+        sub = " · ".join(x for x in (artistas, album, c.get("duration") or "") if x)
+        marca, color = (f"{ACC}▌{RST}", f"{ACC}{BOLD}") if i == sel else (" ", "")
+        for fila in range(alto_item):
+            out.write(f"\x1b[{3 + i * (alto_item + 1) + fila};1H{marca}")
+        out.write(f"\x1b[{y};{x0}H\x1b[K{color}{corta(c['title'], ancho)}{RST}")
+        out.write(f"\x1b[{y + 1};{x0}H\x1b[K{DIM}{corta(sub, ancho)}{RST}")
+
+    out.write("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")
+    try:
+        nota = "\U000F0387\u00a0" if con_imagen else "♪ "   # mismo ícono que el reproductor
+        out.write(f"\x1b[1;2H{ACC}{nota}{RST} {BOLD}{consulta}{RST}")
+        pie = 3 + len(canciones) * (alto_item + 1)
+        out.write(f"\x1b[{pie};2H{MUTE}↑/↓ o 1-{len(canciones)} elegir · Enter reproducir · Esc cancelar{RST}")
+        out.flush()
+        for i, ruta in enumerate(tapas):
+            if ruta:
+                subprocess.run(["kitty", "+kitten", "icat", "--stdin=no", "--transfer-mode=memory", "--scale-up",
+                                "--place", f"{MINI_W}x{MINI_H}@3x{2 + i * (alto_item + 1)}", ruta],
+                               stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        tty.setcbreak(fd)
+        while True:
+            for i in range(len(canciones)):
+                dibujar_item(i)
+            out.flush()
+            k = os.read(fd, 16).decode(errors="ignore")
+            if k in ("\x1b[A", "\x1bOA", "k"):
+                sel = (sel - 1) % len(canciones)
+            elif k in ("\x1b[B", "\x1bOB", "j"):
+                sel = (sel + 1) % len(canciones)
+            elif k.isdigit() and 1 <= int(k) <= len(canciones):
+                resultado = int(k) - 1
+                break
+            elif k in ("\r", "\n"):
+                resultado = sel
+                break
+            elif k in ("\x1b", "q"):
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, viejo)
+        if con_imagen:
+            subprocess.run(["kitty", "+kitten", "icat", "--clear", "--stdin=no"],
+                           stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        out.write("\x1b[?25h\x1b[?1049l")
+        out.flush()
+        for ruta in tapas:
+            if ruta:
+                try:
+                    os.remove(ruta)
+                except OSError:
+                    pass
+    return resultado
+
+
+# ---------------------------------------------------------------- búsqueda
+def main() -> int:
+    args = sys.argv[1:]
+    if args[:1] == ["ctl"]:
+        return ctl(args[1:])
+    if args[:1] == ["ui"]:
+        return barra() if set(args[1:]) & {"-m", "--barra"} else ui()
+
+    listar, fondo, numero_elegido, modo_barra = False, False, None, False
+    while args and args[0] in ("-l", "-b", "-n", "-m", "--barra"):
+        op = args.pop(0)
+        if op == "-l":
+            listar = True
+        elif op in ("-m", "--barra"):
+            modo_barra = True
+        elif op == "-b":
+            fondo = True
+        elif args and args[0].isdigit():
+            numero_elegido = int(args.pop(0))
+        else:
+            print("musica: -n necesita un número", file=sys.stderr)
+            return 2
+    consulta = " ".join(args).strip()
+    if not consulta:
+        print(__doc__, file=sys.stderr)
+        return 2
+    if fondo and numero_elegido is None and not sys.stdin.isatty():
+        print("musica: -b sin terminal necesita -n N (no hay dónde mostrar el menú)", file=sys.stderr)
+        return 2
+    for prog in ("mpv", "yt-dlp"):
+        if shutil.which(prog) is None:
+            print(f"musica: falta '{prog}' (instalalo y probá de nuevo)", file=sys.stderr)
+            return 1
+
+    from ytmusicapi import YTMusic
+    yt = YTMusic()
+    try:
+        canciones = yt.search(consulta, filter="songs", limit=RESULTADOS)[:RESULTADOS]
+    except Exception as e:
+        print(f"musica: no se pudo buscar en YouTube Music: {e}", file=sys.stderr)
+        return 1
+    canciones = [c for c in canciones if c.get("videoId")]
+    if not canciones:
+        print("musica: sin resultados", file=sys.stderr)
+        return 1
+
+    textos = []
+    for c in canciones:
+        artistas = ", ".join(a["name"] for a in c.get("artists") or []) or "?"
+        album = (c.get("album") or {}).get("name") or ""
+        textos.append(f"{c['title']}  —  {artistas}" + (f"  ·  {album}" if album else "")
+                      + f"  ·  {c.get('duration') or '?'}")
+    lineas = [f"{i}) {t}" for i, t in enumerate(textos, 1)]
+
+    if listar:
+        print("\n".join(lineas))
+        return 0
+    if numero_elegido is not None:
+        if not 1 <= numero_elegido <= len(canciones):
+            print(f"musica: elegí un número entre 1 y {len(canciones)}", file=sys.stderr)
+            return 2
+        i = numero_elegido - 1
+    else:
+        if not sys.stdin.isatty():
+            print("musica: el menú necesita una terminal (usá -l y -n N)", file=sys.stderr)
+            return 2
+        i = menu(consulta, canciones)
+        if i is None:
+            return 0  # cancelado
+
+    otro_ui = ui_abierto()
+    if not fondo and sys.stdin.isatty() and not otro_ui:
+        # si cierran la terminal mientras carga, no dejar música huérfana sonando
+        # (con otro reproductor abierto la música es de él: no se toca)
+        def colgar(*_):
+            try:
+                mpv("quit")
+            except (ConnectionError, RuntimeError):
+                pass
+            os._exit(0)
+        signal.signal(signal.SIGHUP, colgar)
+    codigo = reproducir(canciones[i], textos[i], yt)
+    if codigo != 0 or fondo or not sys.stdin.isatty():
+        return codigo
+    if otro_ui:
+        print("  (se ve en el reproductor que ya tenés abierto en otra terminal)")
+        return 0
+    return barra() if modo_barra else ui()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
